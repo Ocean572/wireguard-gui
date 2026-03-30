@@ -9,6 +9,8 @@ import subprocess
 import os
 import urllib.request
 import json
+import time
+import traceback
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional, Set
@@ -22,60 +24,73 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QSize
 from PyQt6.QtGui import QIcon, QFont, QColor, QTextCursor, QPixmap
 
+# Global Log Helper
+LOG_FILE = "/tmp/wireguard-gui.log"
+def log(msg):
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{datetime.now().strftime('%H:%M:%S')}] GUI: {msg}\n")
+    except: pass
+
+def crash_handler(etype, value, tb):
+    err = "".join(traceback.format_exception(etype, value, tb))
+    log(f"CRITICAL UNHANDLED EXCEPTION:\n{err}")
+    sys.__excepthook__(etype, value, tb)
+
+sys.excepthook = crash_handler
+
+log("--- GUI Application Starting ---")
 
 class IPFetcher(QObject):
-    """Fetches public IP information asynchronously"""
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
-
+    
     def run(self):
-        try:
-            # Use ip-api.com for IP and location info
-            with urllib.request.urlopen("http://ip-api.com/json/", timeout=5) as response:
-                data = json.loads(response.read().decode())
-                self.finished.emit(data)
-        except Exception as e:
-            self.error.emit(str(e))
-
+        log("IPFetcher: Run started")
+        services = [
+            {"url": "https://ip-api.com/json/", "format": "json"},
+            {"url": "https://api.ipify.org?format=json", "format": "json"}
+        ]
+        for service in services:
+            try:
+                log(f"IPFetcher: Trying {service['url']}")
+                req = urllib.request.Request(service["url"], headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode())
+                    res = {"query": data.get("query") or data.get("ip"), "city": data.get("city", ""), "country": data.get("country", "")}
+                    if res["query"]: 
+                        log(f"IPFetcher: Success {res['query']}")
+                        self.finished.emit(res); return
+            except Exception as e:
+                log(f"IPFetcher: Error {str(e)}")
+        self.error.emit("Failed")
 
 class CommandRunner(QObject):
-    """Runs commands asynchronously and emits signals with output"""
     output_received = pyqtSignal(str)
-    error_received = pyqtSignal(str)
-    finished = pyqtSignal(int)  # exit code
+    finished = pyqtSignal(int)
     
-    def __init__(self):
+    def __init__(self, command: List[str]):
         super().__init__()
+        self.command = command
         self.process = None
         
-    def run_command(self, command: List[str]):
-        """Run a command as current user (should be root)"""
+    def run(self):
+        log(f"CommandRunner: Executing {' '.join(self.command)}")
         try:
-            self.output_received.emit(f"[{datetime.now().strftime('%H:%M:%S')}] Running: {' '.join(command)}\n")
-            
-            self.process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
-            
+            self.output_received.emit(f"[{datetime.now().strftime('%H:%M:%S')}] Exec: {' '.join(self.command)}\n")
+            self.process = subprocess.Popen(self.command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             if self.process.stdout:
                 for line in self.process.stdout:
                     self.output_received.emit(line)
-                
-            self.process.wait()
-            self.finished.emit(self.process.returncode)
-            
+            return_code = self.process.wait()
+            log(f"CommandRunner: Finished with code {return_code}")
+            self.finished.emit(return_code)
         except Exception as e:
-            self.error_received.emit(f"Error running command: {str(e)}\n")
+            log(f"CommandRunner: Exception {str(e)}")
+            self.output_received.emit(f"Error: {str(e)}\n")
             self.finished.emit(-1)
 
-
 class WireGuardStatusMonitor(QObject):
-    """Monitors WireGuard status in real-time"""
-    status_updated = pyqtSignal(str)  # tunnel name
     output_received = pyqtSignal(str)
     
     def __init__(self, tunnel_name: str):
@@ -83,420 +98,416 @@ class WireGuardStatusMonitor(QObject):
         self.tunnel_name = tunnel_name
         self.running = False
         
-    def start_monitoring(self):
-        """Start monitoring wg show output"""
+    def run(self):
+        log(f"Monitor: Started for {self.tunnel_name}")
         self.running = True
         try:
             while self.running:
-                try:
-                    # Check if interface exists in sysfs
-                    if not os.path.exists(f"/sys/class/net/{self.tunnel_name}"):
-                        break
-
-                    result = subprocess.run(['wg', 'show', self.tunnel_name], capture_output=True, text=True, timeout=2)
-                    if result.returncode == 0:
-                        self.output_received.emit(f"[{datetime.now().strftime('%H:%M:%S')}]\n{result.stdout}")
-                    
-                except Exception:
-                    pass
-                    
+                if not os.path.exists(f"/sys/class/net/{self.tunnel_name}"): 
+                    log(f"Monitor: Interface {self.tunnel_name} gone, exiting")
+                    break
+                res = subprocess.run(['wg', 'show', self.tunnel_name], capture_output=True, text=True, timeout=2)
+                if res.returncode == 0:
+                    self.output_received.emit(f"[{datetime.now().strftime('%H:%M:%S')}]\n{res.stdout}")
+                
+                # Check periodically for stop request
                 for _ in range(20):
                     if not self.running: break
                     QThread.msleep(100)
-                    
         except Exception as e:
-            self.output_received.emit(f"Monitoring error: {str(e)}\n")
+            log(f"Monitor: Exception {str(e)}")
+        finally:
+            log(f"Monitor: Finished for {self.tunnel_name}")
             
-    def stop_monitoring(self):
+    def stop(self): 
+        log(f"Monitor: Stop requested for {self.tunnel_name}")
         self.running = False
-
-
-class ConfigEditorDialog(QDialog):
-    """Dialog for editing WireGuard configuration files"""
-    
-    def __init__(self, parent=None, config_name: str = "", config_content: str = ""):
-        super().__init__(parent)
-        self.config_name = config_name
-        self.setWindowTitle(f"Edit Config: {config_name}" if config_name else "New Config")
-        self.setGeometry(100, 100, 700, 500)
-        
-        layout = QVBoxLayout(self)
-        
-        name_layout = QHBoxLayout()
-        name_layout.addWidget(QLabel("Config Name:"))
-        self.name_input = QTextEdit()
-        self.name_input.setMaximumHeight(30)
-        self.name_input.setText(config_name)
-        self.name_input.setReadOnly(not not config_name == "")
-        name_layout.addWidget(self.name_input)
-        layout.addLayout(name_layout)
-        
-        layout.addWidget(QLabel("Config Content:"))
-        self.editor = QTextEdit()
-        self.editor.setFont(QFont("Monospace", 9))
-        self.editor.setText(config_content)
-        layout.addWidget(self.editor)
-        
-        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-    
-    def get_config_name(self) -> str: return self.name_input.toPlainText().strip()
-    def get_config_content(self) -> str: return self.editor.toPlainText()
-
 
 class WireGuardGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        log("WireGuardGUI: Init")
         self.wg_dir = Path("/etc/wireguard")
         self.tunnels: List[str] = []
         self.current_tunnel: Optional[str] = None
         self.connected_tunnels: Set[str] = set()
-        self.command_runner = None
-        self.command_thread = None
-        self.monitor_thread = None
-        self.monitor = None
-        self.ip_thread = None
         
-        # Set icon immediately
+        # Thread and Worker Management
+        self.ip_thread: Optional[QThread] = None
+        self.ip_worker: Optional[IPFetcher] = None
+        
+        self.command_thread: Optional[QThread] = None
+        self.command_worker: Optional[CommandRunner] = None
+        
+        self.monitor_thread: Optional[QThread] = None
+        self.monitor_worker: Optional[WireGuardStatusMonitor] = None
+        
         self.set_window_icon()
-        
         self.init_ui()
-        
-        # Load initial data
         self.load_tunnels()
         self.update_connection_status()
         self.refresh_ip_info()
         
-        # Timers
+        # UI Update Timers
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.update_connection_status)
         self.status_timer.start(3000)
-
+        
         self.ip_timer = QTimer()
         self.ip_timer.timeout.connect(self.refresh_ip_info)
         self.ip_timer.start(60000)
         
     def init_ui(self):
+        log("WireGuardGUI: Building UI")
         self.setWindowTitle("WireGuard Manager (Root)")
         self.setMinimumSize(950, 650)
         
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
+        cw = QWidget()
+        self.setCentralWidget(cw)
+        main_layout = QHBoxLayout(cw)
         
         left_layout = QVBoxLayout()
         
+        # Logo
         logo_label = QLabel()
         logo_path = str(Path(__file__).parent.resolve() / "wireguard.png")
-        logo_pixmap = QPixmap(logo_path)
-        if not logo_pixmap.isNull():
-            logo_label.setPixmap(logo_pixmap.scaled(90, 90, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        pix = QPixmap(logo_path)
+        if not pix.isNull():
+            logo_label.setPixmap(pix.scaled(90, 90, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             left_layout.addWidget(logo_label)
-        
+            
+        # IP Info Box
         ip_frame = QFrame()
-        ip_frame.setFrameShape(QFrame.Shape.StyledPanel)
         ip_frame.setStyleSheet("background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px;")
         ip_layout = QVBoxLayout(ip_frame)
-        self.ip_label = QLabel("Public IP: Fetching...")
+        self.ip_label = QLabel("IP: Fetching...")
         self.ip_label.setFont(QFont("SansSerif", 9, QFont.Weight.Bold))
+        self.location_label = QLabel("Loc: ...")
         ip_layout.addWidget(self.ip_label)
-        self.location_label = QLabel("Location: ...")
-        self.location_label.setFont(QFont("SansSerif", 8))
         ip_layout.addWidget(self.location_label)
         left_layout.addWidget(ip_frame)
         
-        list_header = QHBoxLayout()
-        list_header.addWidget(QLabel("Available Tunnels:"))
+        # Tunnel List
+        hdr_layout = QHBoxLayout()
+        hdr_layout.addWidget(QLabel("Tunnels:"))
         refresh_btn = QPushButton("Refresh")
         refresh_btn.setFixedWidth(70)
         refresh_btn.clicked.connect(self.load_tunnels)
-        list_header.addWidget(refresh_btn)
-        left_layout.addLayout(list_header)
+        hdr_layout.addWidget(refresh_btn)
+        left_layout.addLayout(hdr_layout)
         
         self.tunnel_list = QListWidget()
         self.tunnel_list.itemClicked.connect(self.on_tunnel_selected)
         left_layout.addWidget(self.tunnel_list)
         
-        config_btn_layout = QHBoxLayout()
-        self.add_config_btn = QPushButton("+ New")
-        self.add_config_btn.clicked.connect(self.add_new_config)
-        config_btn_layout.addWidget(self.add_config_btn)
-        self.edit_config_btn = QPushButton("Edit")
-        self.edit_config_btn.clicked.connect(self.edit_config)
-        self.edit_config_btn.setEnabled(False)
-        config_btn_layout.addWidget(self.edit_config_btn)
-        self.delete_config_btn = QPushButton("Delete")
-        self.delete_config_btn.clicked.connect(self.delete_config)
-        self.delete_config_btn.setEnabled(False)
-        config_btn_layout.addWidget(self.delete_config_btn)
-        left_layout.addLayout(config_btn_layout)
+        # Control Buttons
+        btn_layout = QHBoxLayout()
+        self.conn_btn = QPushButton("Connect")
+        self.conn_btn.setEnabled(False)
+        self.conn_btn.setMinimumHeight(45)
+        self.conn_btn.setStyleSheet("font-weight: bold; background-color: #0d6efd; color: white;")
+        self.conn_btn.clicked.connect(self.connect_tunnel)
         
-        button_layout = QHBoxLayout()
-        self.connect_btn = QPushButton("Connect")
-        self.connect_btn.clicked.connect(self.connect_tunnel)
-        self.connect_btn.setEnabled(False)
-        self.connect_btn.setMinimumHeight(45)
-        self.connect_btn.setStyleSheet("font-weight: bold; background-color: #0d6efd; color: white;")
-        button_layout.addWidget(self.connect_btn)
+        self.disc_btn = QPushButton("Disconnect")
+        self.disc_btn.setEnabled(False)
+        self.disc_btn.setMinimumHeight(45)
+        self.disc_btn.clicked.connect(self.disconnect_tunnel)
         
-        self.disconnect_btn = QPushButton("Disconnect")
-        self.disconnect_btn.clicked.connect(self.disconnect_tunnel)
-        self.disconnect_btn.setEnabled(False)
-        self.disconnect_btn.setMinimumHeight(45)
-        button_layout.addWidget(self.disconnect_btn)
-        left_layout.addLayout(button_layout)
+        btn_layout.addWidget(self.conn_btn)
+        btn_layout.addWidget(self.disc_btn)
+        left_layout.addLayout(btn_layout)
         
+        # Right Panel
         right_layout = QVBoxLayout()
-        right_layout.addWidget(QLabel("Status Information:"))
-        self.status_display = QTextEdit()
-        self.status_display.setReadOnly(True)
-        self.status_display.setFont(QFont("Monospace", 9))
-        right_layout.addWidget(self.status_display)
+        right_layout.addWidget(QLabel("Status:"))
+        self.status_disp = QTextEdit()
+        self.status_disp.setReadOnly(True)
+        self.status_disp.setFont(QFont("Monospace", 9))
+        right_layout.addWidget(self.status_disp)
         
         right_layout.addWidget(QLabel("Debug Output:"))
-        self.output_display = QTextEdit()
-        self.output_display.setReadOnly(True)
-        self.output_display.setFont(QFont("Monospace", 9))
-        self.output_display.setMaximumHeight(180)
-        right_layout.addWidget(self.output_display)
+        self.output_disp = QTextEdit()
+        self.output_disp.setReadOnly(True)
+        self.output_disp.setFont(QFont("Monospace", 9))
+        self.output_disp.setMaximumHeight(180)
+        right_layout.addWidget(self.output_disp)
         
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        lw, rw = QWidget(), QWidget()
-        lw.setLayout(left_layout); rw.setLayout(right_layout)
-        splitter.addWidget(lw); splitter.addWidget(rw)
-        splitter.setStretchFactor(0, 1); splitter.setStretchFactor(1, 2)
+        lw = QWidget(); lw.setLayout(left_layout)
+        rw = QWidget(); rw.setLayout(right_layout)
+        splitter.addWidget(lw)
+        splitter.addWidget(rw)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
         main_layout.addWidget(splitter)
         
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
-        if os.geteuid() == 0:
-            self.statusBar.showMessage("Running with Root privileges")
-        else:
-            self.statusBar.showMessage("Running as Normal User - Use run.sh for root")
         
-        self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(self.get_icon())
-        self.tray_menu = QMenu()
-        self.connect_menu = QMenu("Connect", self.tray_menu)
-        self.tray_menu.addMenu(self.connect_menu)
-        self.tray_disconnect_action = self.tray_menu.addAction("Disconnect")
-        self.tray_disconnect_action.triggered.connect(self.disconnect_tunnel)
-        self.tray_menu.addSeparator()
-        exit_action = self.tray_menu.addAction("Exit")
-        exit_action.triggered.connect(QApplication.instance().quit)
-        self.tray_icon.setContextMenu(self.tray_menu)
-        self.tray_icon.show()
-        self.tray_icon.activated.connect(self.on_tray_icon_activated)
+        # Tray Icon
+        self.tray = QSystemTrayIcon(self)
+        self.tray.setIcon(self.get_icon())
+        tm = QMenu()
+        ex = tm.addAction("Exit")
+        ex.triggered.connect(QApplication.instance().quit)
+        self.tray.setContextMenu(tm)
+        self.tray.show()
 
-    def on_tray_icon_activated(self, reason):
-        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            self.showNormal(); self.activateWindow()
-
-    def update_tray_menu(self):
-        self.connect_menu.clear()
-        if not self.tunnels:
-            self.connect_menu.addAction("No configs found").setEnabled(False)
-            return
-        for tunnel in self.tunnels:
-            action = self.connect_menu.addAction(tunnel)
-            action.triggered.connect(lambda checked, t=tunnel: self.connect_from_tray(t))
-            if tunnel in self.connected_tunnels:
-                action.setEnabled(False); action.setText(f"{tunnel} (Connected)")
-
-    def connect_from_tray(self, tunnel_name):
-        self.current_tunnel = tunnel_name
-        for i in range(self.tunnel_list.count()):
-            if self.tunnel_list.item(i).text().rstrip(' *') == tunnel_name:
-                self.tunnel_list.setCurrentRow(i); break
-        self.connect_tunnel()
-        
     def get_icon(self) -> QIcon:
-        """Helper to get icon from absolute path"""
-        icon_file = Path(__file__).parent.resolve() / "wireguard.png"
-        if icon_file.exists():
-            return QIcon(str(icon_file))
-        return QIcon()
+        p = Path(__file__).parent.resolve() / "wireguard.png"
+        return QIcon(str(p)) if p.exists() else QIcon()
 
     def set_window_icon(self):
-        """Set icons for windows and application"""
-        icon = self.get_icon()
-        if not icon.isNull():
-            self.setWindowIcon(icon)
-            QApplication.setWindowIcon(icon)
-    
+        ic = self.get_icon()
+        if not ic.isNull():
+            self.setWindowIcon(ic)
+            QApplication.setWindowIcon(ic)
+            
     def refresh_ip_info(self):
-        if self.ip_thread and self.ip_thread.isRunning(): return
-        self.fetcher = IPFetcher()
-        self.fetcher.finished.connect(self.on_ip_fetched)
+        if self.ip_thread and self.ip_thread.isRunning():
+            return
+            
+        log("WireGuardGUI: Refreshing IP info")
+        self.ip_label.setText("IP: Fetching...")
+        
+        self.ip_worker = IPFetcher()
         self.ip_thread = QThread()
-        self.fetcher.moveToThread(self.ip_thread)
-        self.ip_thread.started.connect(self.fetcher.run)
-        self.fetcher.finished.connect(self.ip_thread.quit)
+        self.ip_worker.moveToThread(self.ip_thread)
+        
+        self.ip_thread.started.connect(self.ip_worker.run)
+        self.ip_worker.finished.connect(self.on_ip_fetched)
+        self.ip_worker.error.connect(self.on_ip_error)
+        
+        self.ip_worker.finished.connect(self.ip_thread.quit)
+        self.ip_worker.error.connect(self.ip_thread.quit)
+        
+        # cleanup reference when finished to avoid RuntimeError
+        self.ip_thread.finished.connect(self._cleanup_ip_thread)
         self.ip_thread.start()
         
-    def on_ip_fetched(self, data):
-        self.ip_label.setText(f"Public IP: {data.get('query', 'Unknown')}")
-        self.location_label.setText(f"Location: {data.get('city', '')}, {data.get('country', '')}")
+    def _cleanup_ip_thread(self):
+        log("WireGuardGUI: IP thread finished")
+        if self.ip_thread:
+            self.ip_thread.deleteLater()
+            self.ip_thread = None
+        self.ip_worker = None
+        
+    def on_ip_fetched(self, d):
+        log(f"WireGuardGUI: IP info received: {d['query']}")
+        self.ip_label.setText(f"IP: {d.get('query', 'Unknown')}")
+        c, ct = d.get('city', ''), d.get('country', '')
+        self.location_label.setText(f"Loc: {c}, {ct}" if c or ct else "Loc: Unknown")
+        
+    def on_ip_error(self, e):
+        log(f"WireGuardGUI: IP fetch error: {e}")
+        self.ip_label.setText("IP: Error")
         
     def load_tunnels(self):
+        log("WireGuardGUI: Loading tunnels")
         try:
-            # Check for configs - should work fine as root
-            result = subprocess.run(['bash', '-c', f'ls {self.wg_dir}/*.conf 2>/dev/null'], capture_output=True, text=True)
-            if result.returncode == 0:
-                self.tunnels = sorted([Path(f).stem for f in result.stdout.strip().split('\n') if f])
-            else:
-                self.tunnels = []
-            
+            res = subprocess.run(['bash', '-c', f'ls {self.wg_dir}/*.conf 2>/dev/null'], capture_output=True, text=True)
+            self.tunnels = sorted([Path(f).stem for f in res.stdout.strip().split('\n') if f])
             self.tunnel_list.clear()
-            for t in self.tunnels: self.tunnel_list.addItem(t)
-            self.statusBar.showMessage(f"Loaded {len(self.tunnels)} tunnel(s)")
-            self.update_tray_menu(); self.update_connection_status()
-            
+            for t in self.tunnels:
+                self.tunnel_list.addItem(t)
+            log(f"WireGuardGUI: Found {len(self.tunnels)} tunnels")
         except Exception as e:
-            self.append_output(f"Error loading tunnels: {str(e)}\n")
-    
+            log(f"WireGuardGUI: Load error: {str(e)}")
+            
     def update_connection_status(self):
-        """Monitors /sys/class/net/ for active WG interfaces (root-less)"""
         try:
             active = set()
             if os.path.exists("/sys/class/net/"):
                 for iface in os.listdir("/sys/class/net/"):
-                    if iface in self.tunnels: active.add(iface)
+                    if iface in self.tunnels:
+                        active.add(iface)
             
-            # Reconcile with UI
             if active != self.connected_tunnels:
+                log(f"WireGuardGUI: Active interfaces changed: {active}")
                 self.connected_tunnels = active
-                self.update_tray_menu()
-                self.tray_disconnect_action.setEnabled(len(self.connected_tunnels) > 0)
                 self.refresh_ip_info()
                 
                 if self.current_tunnel:
-                    is_up = self.current_tunnel in self.connected_tunnels
-                    self.connect_btn.setEnabled(not is_up)
-                    self.disconnect_btn.setEnabled(is_up)
-                
+                    is_up = self.current_tunnel in active
+                    self.conn_btn.setEnabled(not is_up)
+                    self.disc_btn.setEnabled(is_up)
+                    
                 for i in range(self.tunnel_list.count()):
                     item = self.tunnel_list.item(i)
-                    item.setBackground(QColor("#d1e7dd" if item.text() in active else "white"))
-        except: pass
-    
+                    if item.text() in active:
+                        item.setBackground(QColor("#d1e7dd"))
+                    else:
+                        item.setBackground(QColor("white"))
+        except Exception as e:
+            log(f"WireGuardGUI: Status update error: {str(e)}")
+            
     def on_tunnel_selected(self, item):
         self.current_tunnel = item.text()
+        log(f"WireGuardGUI: Tunnel selected: {self.current_tunnel}")
         is_up = self.current_tunnel in self.connected_tunnels
-        self.connect_btn.setEnabled(not is_up); self.disconnect_btn.setEnabled(is_up)
-        self.edit_config_btn.setEnabled(True); self.delete_config_btn.setEnabled(True)
+        self.conn_btn.setEnabled(not is_up)
+        self.disc_btn.setEnabled(is_up)
         self.display_tunnel_info()
-    
+        
     def display_tunnel_info(self):
         if not self.current_tunnel: return
-        self.status_display.clear()
+        self.status_disp.clear()
         is_up = self.current_tunnel in self.connected_tunnels
         info = f"Tunnel: {self.current_tunnel}\nStatus: {'ACTIVE' if is_up else 'INACTIVE'}\n" + "-"*30 + "\n"
         if is_up:
             try:
                 res = subprocess.run(['wg', 'show', self.current_tunnel], capture_output=True, text=True, timeout=1)
-                info += res.stdout if res.returncode == 0 else "Could not fetch status."
-            except: info += "Could not fetch status."
-        self.status_display.setText(info)
-    
-    def add_new_config(self):
-        template = "[Interface]\nAddress = 10.0.0.2/32\nPrivateKey = <key>\n\n[Peer]\nPublicKey = <key>\nAllowedIPs = 0.0.0.0/0\nEndpoint = vpn.example.com:51820"
-        dialog = ConfigEditorDialog(self, "", template)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            n, c = dialog.get_config_name(), dialog.get_config_content()
-            if not n: return
-            try:
-                with open(f"{self.wg_dir}/{n}.conf", "w") as f: f.write(c)
-                self.load_tunnels()
-            except Exception as e: QMessageBox.critical(self, "Error", str(e))
-    
-    def edit_config(self):
-        if not self.current_tunnel: return
-        p = self.wg_dir / f"{self.current_tunnel}.conf"
-        try:
-            with open(p, "r") as f: content = f.read()
-            dialog = ConfigEditorDialog(self, self.current_tunnel, content)
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                with open(p, "w") as f: f.write(dialog.get_config_content())
-                self.load_tunnels()
-        except Exception as e: QMessageBox.critical(self, "Error", str(e))
-    
-    def delete_config(self):
-        if not self.current_tunnel or self.current_tunnel in self.connected_tunnels: return
-        if QMessageBox.question(self, "Delete", f"Delete {self.current_tunnel}?") == QMessageBox.StandardButton.Yes:
-            try:
-                os.remove(self.wg_dir / f"{self.current_tunnel}.conf")
-                self.load_tunnels(); self.current_tunnel = None
-            except Exception as e: QMessageBox.critical(self, "Error", str(e))
-    
+                if res.returncode == 0:
+                    info += res.stdout
+            except: pass
+        self.status_disp.setText(info)
+
     def connect_tunnel(self):
         if not self.current_tunnel: return
-        self.append_output(f"\n[{datetime.now().strftime('%H:%M:%S')}] Activating {self.current_tunnel}...\n")
-        self.connect_btn.setEnabled(False); self.disconnect_btn.setEnabled(False)
-        self.command_runner = CommandRunner()
-        self.command_runner.output_received.connect(self.append_output)
-        self.command_runner.finished.connect(self.on_connect_finished)
+        if self.command_thread and self.command_thread.isRunning():
+            log("WireGuardGUI: Command already running")
+            return
+            
+        log(f"WireGuardGUI: Connect requested for {self.current_tunnel}")
+        self.conn_btn.setEnabled(False)
+        self.disc_btn.setEnabled(False)
+        self.append_output(f"\nActivating {self.current_tunnel}...\n")
+        
+        self.command_worker = CommandRunner(['wg-quick', 'up', self.current_tunnel])
         self.command_thread = QThread()
-        self.command_runner.moveToThread(self.command_thread)
-        self.command_thread.started.connect(lambda: self.command_runner.run_command(['wg-quick', 'up', self.current_tunnel]))
+        self.command_worker.moveToThread(self.command_thread)
+        
+        self.command_thread.started.connect(self.command_worker.run)
+        self.command_worker.output_received.connect(self.append_output)
+        self.command_worker.finished.connect(self.on_connect_finished)
+        self.command_worker.finished.connect(self.command_thread.quit)
+        
+        self.command_thread.finished.connect(self._cleanup_command_thread)
         self.command_thread.start()
-    
+        
+    def _cleanup_command_thread(self):
+        log("WireGuardGUI: Command thread finished")
+        if self.command_thread:
+            self.command_thread.deleteLater()
+            self.command_thread = None
+        self.command_worker = None
+        # Trigger UI update
+        self.update_connection_status()
+        self.display_tunnel_info()
+        
+    def on_connect_finished(self, code):
+        log(f"WireGuardGUI: Connect finished with code {code}")
+        if code == 0:
+            self.start_monitoring()
+        else:
+            self.conn_btn.setEnabled(True)
+            self.disc_btn.setEnabled(False)
+            
     def disconnect_tunnel(self):
         target = self.current_tunnel
         if not target or target not in self.connected_tunnels:
-            if self.connected_tunnels: target = list(self.connected_tunnels)[0]
-            else: return
+            if self.connected_tunnels:
+                target = list(self.connected_tunnels)[0]
+            else:
+                return
+                
+        if self.command_thread and self.command_thread.isRunning():
+            log("WireGuardGUI: Command already running")
+            return
+            
+        log(f"WireGuardGUI: Disconnect requested for {target}")
+        self.conn_btn.setEnabled(False)
+        self.disc_btn.setEnabled(False)
+        self.append_output(f"\nDeactivating {target}...\n")
         
-        self.append_output(f"\n[{datetime.now().strftime('%H:%M:%S')}] Deactivating {target}...\n")
-        self.connect_btn.setEnabled(False); self.disconnect_btn.setEnabled(False)
-        if self.monitor: self.monitor.stop_monitoring(); self.monitor = None
-        self.command_runner = CommandRunner()
-        self.command_runner.output_received.connect(self.append_output)
-        self.command_runner.finished.connect(self.on_disconnect_finished)
+        if self.monitor_worker:
+            log("WireGuardGUI: Stopping monitor before disconnect")
+            self.monitor_worker.stop()
+            
+        # Give the monitor a moment to stop before running wg-quick down
+        QTimer.singleShot(1000, lambda: self._do_disconnect(target))
+
+    def _do_disconnect(self, target):
+        log(f"WireGuardGUI: _do_disconnect for {target}")
+        
+        self.command_worker = CommandRunner(['wg-quick', 'down', target])
         self.command_thread = QThread()
-        self.command_runner.moveToThread(self.command_thread)
-        self.command_thread.started.connect(lambda: self.command_runner.run_command(['wg-quick', 'down', target]))
+        self.command_worker.moveToThread(self.command_thread)
+        
+        self.command_thread.started.connect(self.command_worker.run)
+        self.command_worker.output_received.connect(self.append_output)
+        self.command_worker.finished.connect(self.on_disconnect_finished)
+        self.command_worker.finished.connect(self.command_thread.quit)
+        
+        self.command_thread.finished.connect(self._cleanup_command_thread)
         self.command_thread.start()
-    
-    def on_connect_finished(self, code):
-        self.update_connection_status(); self.display_tunnel_info()
-        self.statusBar.showMessage("Connected" if code == 0 else "Connection Failed")
-        if code == 0: self.start_monitoring()
-        else: self.connect_btn.setEnabled(True)
-    
+        
     def on_disconnect_finished(self, code):
-        self.update_connection_status(); self.display_tunnel_info()
-        self.statusBar.showMessage("Disconnected" if code == 0 else "Deactivation Failed")
-        self.connect_btn.setEnabled(True)
-    
+        log(f"WireGuardGUI: Disconnect finished with code {code}")
+        # UI update is handled by _cleanup_command_thread
+        
     def start_monitoring(self):
-        if not self.current_tunnel or self.current_tunnel not in self.connected_tunnels: return
-        if self.monitor: self.monitor.stop_monitoring()
-        self.monitor = WireGuardStatusMonitor(self.current_tunnel)
-        self.monitor.output_received.connect(lambda out: self.status_display.setText(out))
+        if not self.current_tunnel or self.current_tunnel not in self.connected_tunnels:
+            return
+            
+        if self.monitor_thread and self.monitor_thread.isRunning():
+            log("WireGuardGUI: Monitor already running, stopping first")
+            self.monitor_worker.stop()
+            self.monitor_thread.quit()
+            self.monitor_thread.wait(1000)
+            
+        log(f"WireGuardGUI: Starting status monitor for {self.current_tunnel}")
+        self.monitor_worker = WireGuardStatusMonitor(self.current_tunnel)
         self.monitor_thread = QThread()
-        self.monitor.moveToThread(self.monitor_thread)
-        self.monitor_thread.started.connect(self.monitor.start_monitoring)
+        self.monitor_worker.moveToThread(self.monitor_thread)
+        
+        self.monitor_thread.started.connect(self.monitor_worker.run)
+        self.monitor_worker.output_received.connect(lambda out: self.status_disp.setText(out))
+        
+        self.monitor_thread.finished.connect(self._cleanup_monitor_thread)
         self.monitor_thread.start()
-    
+        
+    def _cleanup_monitor_thread(self):
+        log("WireGuardGUI: Monitor thread finished")
+        if self.monitor_thread:
+            self.monitor_thread.deleteLater()
+            self.monitor_thread = None
+        self.monitor_worker = None
+        
     def append_output(self, text):
-        c = self.output_display.textCursor(); c.movePosition(QTextCursor.MoveOperation.End)
-        c.insertText(text); self.output_display.setTextCursor(c)
-        self.output_display.ensureCursorVisible()
-    
+        c = self.output_disp.textCursor()
+        c.movePosition(QTextCursor.MoveOperation.End)
+        c.insertText(text)
+        self.output_disp.setTextCursor(c)
+        self.output_disp.ensureCursorVisible()
+        
     def closeEvent(self, event):
-        if self.monitor: self.monitor.stop_monitoring()
-        self.status_timer.stop(); self.ip_timer.stop(); event.accept()
+        log("WireGuardGUI: closeEvent received")
+        self.status_timer.stop()
+        self.ip_timer.stop()
+        
+        if self.monitor_worker:
+            self.monitor_worker.stop()
+        if self.monitor_thread:
+            self.monitor_thread.quit()
+            self.monitor_thread.wait(1000)
+            
+        if self.command_thread:
+            self.command_thread.quit()
+            self.command_thread.wait(1000)
+            
+        if self.ip_thread:
+            self.ip_thread.quit()
+            self.ip_thread.wait(1000)
+            
+        event.accept()
 
 def main():
+    log("WireGuardGUI: main() start")
     app = QApplication(sys.argv)
     app.setApplicationName("WireGuard Manager")
-    # Link running app to the .desktop file for GNOME icon matching
-    app.setDesktopFileName("wireguard-gui")
-    
+    app.setDesktopFileName("wireguard-manager")
     window = WireGuardGUI()
     window.show()
     sys.exit(app.exec())

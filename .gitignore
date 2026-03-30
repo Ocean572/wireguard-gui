@@ -9,3 +9,10 @@ venv/
 *.log
 wireguard-gui.desktop
 /tmp/wireguard-gui.log
+wireguard-manager.spec.tmp
+
+# Build and Dist
+build_deb/
+dist/
+rpmbuild/
+'~'/
