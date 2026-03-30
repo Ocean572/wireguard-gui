@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Project
+*.log
+wireguard-gui.desktop
+/tmp/wireguard-gui.log
