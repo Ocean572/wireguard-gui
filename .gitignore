@@ -3,16 +3,27 @@ __pycache__/
 *.py[cod]
 *$py.class
 venv/
+.venv/
+env/
 .env
+*.swp
+*.bak
 
-# Project
-*.log
-wireguard-gui.desktop
-/tmp/wireguard-gui.log
-wireguard-manager.spec.tmp
-
-# Build and Dist
+# Packaging and Build
 build_deb/
 dist/
 rpmbuild/
+wireguard-manager.spec.tmp
 '~'/
+
+# Logs
+*.log
+/tmp/wireguard-gui.log
+
+# Project Specific
+GEMINI.md
+wireguard-gui.desktop
+
+# System files
+.DS_Store
+Thumbs.db

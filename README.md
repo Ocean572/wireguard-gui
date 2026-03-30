@@ -23,7 +23,11 @@ The installation script will automatically attempt to install these for you:
 - `PyQt6`
 
 ### Setup
-1. Clone the repository to your preferred location.
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/Ocean572/wireguard-gui.git
+   cd wireguard-gui
+   ```
 2. Run the setup script to install dependencies and create the desktop shortcut:
    ```bash
    sudo ./setup.sh --install-desktop
